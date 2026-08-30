@@ -126,3 +126,25 @@ one there today is the reference.)
 
 Main-panel split UX, session persistence, native file-tree widget, multi-window
 socket routing, rebrand (Phase 7, last).
+
+## Phase 2 integration points (verified 29Aug2026)
+
+Model: `ContextGrid` (layout/mod.rs:108) = one TAB = its own `TaffyTree`
+(root_node → panel leaves → `ContextGridItem` = PTY `Context`).
+`ContextManager` (context/mod.rs:132) = one WINDOW = `SmallVec<ContextGrid>`
++ `current_index`. `Screen` (screen/mod.rs) owns ContextManager + sugarloaf
++ Island.
+
+Layout flow on resize:
+`Screen::resize` (screen/mod.rs:583) → `resize_all_contexts` (:680) →
+`ContextGrid::resize(w, h, sugarloaf)` (layout/mod.rs:1265) →
+`apply_taffy_layout` (:897) → `compute_layout` (:290); each grid item lands
+in `layout_rect`, which the renderer reads directly.
+
+Dock approach: Screen gains `sidebar_frac`/`bottom_frac` + visibility flags.
+On resize, tab ContextGrids receive the MAIN-area rect (window minus island,
+sidebar, bottom) instead of the full window; two window-owned Contexts
+(sidebar=yazi, bottom=$SHELL, not in the tab SmallVec) get their rects from
+the fractions. Island height offset already exists (see
+`split_right_with_config`, screen/mod.rs:1537). Toggles modeled on
+`ToggleQuake`'s show/hide path.
