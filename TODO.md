@@ -27,6 +27,18 @@ User's layout (fs sidebar on the RIGHT — user corrected this twice, 29Aug2026)
 - [+] dropdown on the RIGHT of the tab bar: New terminal / New crow-cli session
   / New file (hx)
 
+## NEXT TURN — highest priority (after current phase is stable + user-tested)
+
+- [ ] BUG (user report 29Aug2026): clicking a file in the sidebar yazi opens
+      it INSIDE the yazi pane (yazi's own opener/preview). Wrong target. The
+      click must open the file in the MAIN panel: spawn (or focus) a helix
+      tab and load the file there. This is "the point" of the layout.
+      Fix shape: yazi opener config (~/.config/yazi/yazi.toml `[opener]` /
+      rules for text files) → shell out to crowterm's open-file path →
+      spawn/focus hx tab in main panel with the file (Phase 4 socket or
+      direct spawn `hx <path>` as a new tab via the [+] app machinery).
+      Do NOT change the current PLAN until the dock phase is handed off green.
+
 ## Scope (unordered)
 
 - [ ] Dock frame: main tab area | fs sidebar (right, locked, yazi) / bottom
@@ -58,6 +70,11 @@ User's layout (fs sidebar on the RIGHT — user corrected this twice, 29Aug2026)
 - nvim/helix ACP client plugins: user — "potentially someday, but not today".
   We keep using crow_cli.tui's built-in ACP client.
 - Shader-filter fun (hello-kitty-style pastel preset): user is down, after core.
+- Serve crowterm on the WEB (user 29Aug2026): rio's wgpu backend is the
+  on-ramp (sugarloaf has a wasm/web target upstream). Investigate building
+  rioterm for wasm + a web shell, then polish via playwright-cli + the
+  video-frames skill: record the rendered page, click-interact with the
+  wgpu output, vision-judge the frames. No full MCP tooling needed.
 - crow-cli TUI cancel lag: commit c739dec6 did NOT fix the felt lag (user,
   29Aug2026). Revisit during the full python-sdk ACP-ification of crow-cli.tui;
   tracked in crow-cli/TODO.md, not here.

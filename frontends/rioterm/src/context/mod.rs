@@ -8,7 +8,7 @@ use crate::context::title::{
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
 use crate::ime::Ime;
-pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
+pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem, GridKind};
 use crate::messenger::Messenger;
 use crate::performer::{self, Machine};
 use renderable::Cursor;
@@ -139,6 +139,11 @@ pub struct ContextManager<T: EventListener> {
     window_id: WindowId,
     pub config: ContextManagerConfig,
     last_title_update: Option<Instant>,
+    /// crowterm dock: the sidebar yazi's `--client-id` plus the resolved
+    /// `ya` binary, so tab focus changes can `ya emit-to <id> cd <cwd>`.
+    dock_yazi: Option<(String, std::path::PathBuf)>,
+    /// Last cwd published to the sidebar yazi (dedupe guard).
+    last_yazi_cwd: Option<String>,
 }
 
 pub fn create_dead_context<T: rio_backend::event::EventListener>(
@@ -426,6 +431,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config: ctx_config,
             last_title_update: None,
+            dock_yazi: None,
+            last_yazi_cwd: None,
         })
     }
 
@@ -464,6 +471,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config,
             last_title_update: None,
+            dock_yazi: None,
+            last_yazi_cwd: None,
         })
     }
 
@@ -575,9 +584,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut Sugarloaf) {
+        // From a dock pane there is no "focused tab" to keep; refuse to
+        // sweep the tab strip away.
+        if self.current_grid_is_dock() {
+            return;
+        }
         let current_route_id = self.current().route_id;
         self.contexts.retain(|ctx| {
-            let keep = ctx.current().route_id == current_route_id;
+            // Dock panes are not tabs; they survive the sweep.
+            let keep = ctx.kind.is_dock() || ctx.current().route_id == current_route_id;
             if !keep {
                 ctx.remove_from_sugarloaf(sugarloaf);
             }
@@ -709,7 +724,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        self.set_current(self.contexts.len() - 1);
+        let tabs = self.tab_count();
+        if tabs > 0 {
+            self.set_current(tabs - 1);
+        }
     }
 
     #[inline]
@@ -824,6 +842,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    pub fn contexts(&self) -> &SmallVec<[ContextGrid<T>; DEFAULT_CONTEXT_CAPACITY]> {
+        &self.contexts
+    }
+
+    #[inline]
     pub fn current_grid_len(&self) -> usize {
         self.contexts[self.current_index].len()
     }
@@ -849,6 +872,42 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts[self.current_index].get_panel_borders()
     }
 
+    /// crowterm: separator lines outlining the visible dock panes — the
+    /// sidebar's left edge and the bottom bar's top edge. The pane that
+    /// holds focus draws with its active border color so the user can
+    /// tell main panel from subpanel at a glance. Absolute physical px.
+    pub fn get_dock_borders(&self, window_w: f32, window_h: f32) -> Vec<Rect> {
+        let mut borders = Vec::new();
+        for (idx, grid) in self.contexts.iter().enumerate() {
+            if !grid.kind.is_dock() {
+                continue;
+            }
+            let m = grid.scaled_margin;
+            // Hidden panes collapse to zero size — nothing to outline.
+            let pane_w = window_w - m.left - m.right;
+            let pane_h = window_h - m.top - m.bottom;
+            if pane_w <= 0.0 || pane_h <= 0.0 {
+                continue;
+            }
+            let color = if idx == self.current_index {
+                grid.border_active_color()
+            } else {
+                grid.border_color()
+            };
+            let width = grid.border_width();
+            match grid.kind {
+                GridKind::Sidebar => {
+                    borders.push(Rect::new(m.left - width, m.top, width, pane_h, color));
+                }
+                GridKind::BottomBar => {
+                    borders.push(Rect::new(0.0, m.top - width, window_w, width, color));
+                }
+                GridKind::Tab => {}
+            }
+        }
+        borders
+    }
+
     #[inline]
     pub fn get_current_grid_scaled_margin(&self) -> rio_backend::config::layout::Margin {
         self.contexts[self.current_index].get_scaled_margin()
@@ -864,12 +923,159 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
             self.current_route = self.current().route_id;
+            self.sync_yazi_to_focus();
         }
     }
 
     #[inline]
+    pub fn window_id(&self) -> WindowId {
+        self.window_id
+    }
+
+    /// Register the sidebar yazi instance (its `--client-id` and the
+    /// resolved `ya` binary) so focus changes can drive it. Immediately
+    /// publishes the focused tab's cwd.
+    pub fn register_dock_yazi(&mut self, client_id: String, ya_bin: std::path::PathBuf) {
+        self.dock_yazi = Some((client_id, ya_bin));
+        self.last_yazi_cwd = None;
+        self.sync_yazi_to_focus();
+    }
+
+    /// cwd of the focused tab — or of the most recent tab when focus
+    /// sits on a dock pane. Used to spawn dock panes / app tabs where
+    /// the user actually is.
+    #[cfg(not(target_os = "windows"))]
+    pub fn focused_tab_cwd(&self) -> Option<String> {
+        if self.contexts.is_empty() {
+            return None;
+        }
+        let grid_idx = if self.current_grid_is_dock() {
+            if self.tab_count() == 0 {
+                return None;
+            }
+            self.tab_count() - 1
+        } else {
+            self.current_index
+        };
+        let ctx = self.contexts[grid_idx].current();
+        teletypewriter::foreground_process_path(*ctx.main_fd, ctx.shell_pid)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
+    /// crowterm dock: make the filesystem sidebar follow the focused tab.
+    /// Runs `ya emit-to <client-id> cd <cwd>` whenever a tab gains focus
+    /// with a cwd different from the last one published.
+    fn sync_yazi_to_focus(&mut self) {
+        #[cfg(not(target_os = "windows"))]
+        {
+            if self.dock_yazi.is_none() || self.current_grid_is_dock() {
+                return;
+            }
+            let Some(cwd) = self.focused_tab_cwd() else {
+                return;
+            };
+            if self.last_yazi_cwd.as_deref() == Some(cwd.as_str()) {
+                return;
+            }
+            self.last_yazi_cwd = Some(cwd.clone());
+            let (client_id, ya_bin) = self.dock_yazi.clone().unwrap();
+            let _ = std::process::Command::new(ya_bin)
+                .args(["emit-to", &client_id, "cd", &cwd])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+
+    /// Number of regular (non-dock) tabs. Dock grids are always kept at
+    /// the tail of `contexts`, so this is also the index of the first
+    /// dock grid.
+    #[inline]
+    pub fn tab_count(&self) -> usize {
+        self.contexts.iter().filter(|g| g.kind == GridKind::Tab).count()
+    }
+
+    /// Index of the dock grid with the given role, if present.
+    #[inline]
+    pub fn dock_index(&self, kind: GridKind) -> Option<usize> {
+        self.contexts.iter().position(|g| g.kind == kind)
+    }
+
+    #[inline]
+    pub fn current_grid_is_dock(&self) -> bool {
+        self.contexts[self.current_index].kind.is_dock()
+    }
+
+    /// Spawn a dock pane (sidebar / bottom bar) as its own PTY grid and
+    /// append it at the tail of the context list, out of the tab strip.
+    /// Returns the new grid's index. The pane runs `program` (or the
+    /// configured shell when `program` is None).
+    pub fn spawn_dock_grid(
+        &mut self,
+        kind: GridKind,
+        program: Option<(String, Vec<String>)>,
+        rich_text_id: usize,
+        scaled_margin: Margin,
+        dimension: ContextDimension,
+    ) -> Result<usize, Box<dyn Error>> {
+        let mut config = self.config.clone();
+        if let Some((prog, args)) = program {
+            config.shell = Shell {
+                program: Some(prog),
+                args,
+            };
+            // A dock pane runs a specific TUI; spawn it fresh instead of
+            // forking the login shell's process image.
+            #[cfg(not(target_os = "windows"))]
+            {
+                config.use_fork = false;
+            }
+        }
+        // Dock panes open where the user is: inherit the focused tab's
+        // live cwd (yazi's filesystem view starts on the right directory).
+        #[cfg(not(target_os = "windows"))]
+        if config.cwd {
+            if let Some(path) = self.focused_tab_cwd() {
+                config.working_dir = Some(path);
+            }
+        }
+
+        let context = ContextManager::create_context(
+            (&Cursor::default(), false),
+            self.event_proxy.clone(),
+            self.window_id,
+            rich_text_id,
+            dimension,
+            &config,
+        )?;
+
+        let grid = ContextGrid::new(
+            context,
+            scaled_margin,
+            self.config.split_color,
+            self.config.split_active_color,
+            self.config.panel,
+        )
+        .with_kind(kind);
+
+        self.contexts.push(grid);
+        Ok(self.contexts.len() - 1)
+    }
+
+    #[inline]
     pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
-        if self.contexts.len() == 1 {
+        // Dock panes are locked: "close" while focused just returns
+        // focus to the tab strip.
+        if self.current_grid_is_dock() {
+            if self.tab_count() > 0 {
+                self.set_current(self.tab_count() - 1);
+            }
+            return;
+        }
+
+        if self.tab_count() == 1 {
             // MacOS: Close last tab will work, leading to hide and
             // keep Rio running in background.
             #[cfg(target_os = "macos")]
@@ -927,7 +1133,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        if self.contexts.len() - 1 == self.current_index {
+        let tabs = self.tab_count();
+        if tabs == 0 {
+            return;
+        }
+        // Tab cycling never lands on a dock pane; from a dock pane it
+        // returns to the first tab.
+        if self.current_index >= tabs || tabs - 1 == self.current_index {
             self.current_index = 0;
         } else {
             self.current_index += 1;
@@ -944,8 +1156,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        if self.current_index == 0 {
-            self.current_index = self.contexts.len() - 1;
+        let tabs = self.tab_count();
+        if tabs == 0 {
+            return;
+        }
+        if self.current_index == 0 || self.current_index >= tabs {
+            self.current_index = tabs - 1;
         } else {
             self.current_index -= 1;
         }
@@ -955,26 +1171,26 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn move_current_to_prev(&mut self) {
-        let len = self.contexts.len();
-        if len <= 1 {
+        let tabs = self.tab_count();
+        if tabs <= 1 || self.current_grid_is_dock() || self.current_index >= tabs {
             return;
         }
 
         let current = self.current_index;
-        let target_index = if current == 0 { len - 1 } else { current - 1 };
+        let target_index = if current == 0 { tabs - 1 } else { current - 1 };
         self.contexts.swap(current, target_index);
         self.select_tab(target_index);
     }
 
     #[inline]
     pub fn move_current_to_next(&mut self) {
-        let len = self.contexts.len();
-        if len <= 1 {
+        let tabs = self.tab_count();
+        if tabs <= 1 || self.current_grid_is_dock() || self.current_index >= tabs {
             return;
         }
 
         let current = self.current_index;
-        let target_index = if current == len - 1 { 0 } else { current + 1 };
+        let target_index = if current == tabs - 1 { 0 } else { current + 1 };
         self.contexts.swap(current, target_index);
         self.select_tab(target_index);
     }
@@ -986,6 +1202,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         let current = self.current_index;
+        if self.current_grid_is_dock() || target >= self.tab_count() {
+            return;
+        }
         if target == current || target >= self.contexts.len() {
             return;
         }
@@ -1119,27 +1338,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
+    /// Plain-shell tab spawn. Runtime callers go through
+    /// `add_context_with_program`; the test suite uses this wrapper.
+    #[cfg(test)]
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
+        self.add_context_with_program(redirect, rich_text_id, None);
+    }
+
+    /// Create a new tab, optionally overriding the spawned program
+    /// (crowterm `[+]` menu apps). The new tab inherits the focused
+    /// tab's live cwd.
+    pub fn add_context_with_program(
+        &mut self,
+        redirect: bool,
+        rich_text_id: usize,
+        program: Option<(String, Vec<String>)>,
+    ) {
         let mut working_dir = self.config.working_dir.clone();
         if self.config.cwd {
             #[cfg(not(target_os = "windows"))]
             {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
+                if let Some(path) = self.focused_tab_cwd() {
+                    working_dir = Some(path);
                 }
             }
 
             #[cfg(target_os = "windows")]
             {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
                 working_dir = None;
             }
         }
@@ -1152,11 +1378,24 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         let size = self.contexts.len();
         if size < self.capacity {
-            let last_index = self.contexts.len();
+            // New tabs land before the dock grids (kept at the tail).
+            let insert_at = self.tab_count();
 
             let mut cloned_config = self.config.clone();
             if working_dir.is_some() {
                 cloned_config.working_dir = working_dir;
+            }
+            if let Some((prog, args)) = program {
+                cloned_config.shell = Shell {
+                    program: Some(prog),
+                    args,
+                };
+                // An app tab runs a specific program; spawn it fresh
+                // instead of forking the login shell's process image.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    cloned_config.use_fork = false;
+                }
             }
 
             let current = self.current();
@@ -1177,18 +1416,33 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 &cloned_config,
             ) {
                 Ok(new_context) => {
+                    // Inherit a tab's margin, not a dock pane's, when the
+                    // dock currently holds focus.
+                    let margin_source = if self.current_grid_is_dock() && insert_at > 0
+                    {
+                        insert_at - 1
+                    } else {
+                        self.current_index
+                    };
                     let previous_scaled_margin =
-                        self.contexts[self.current_index].scaled_margin;
-                    self.contexts.push(ContextGrid::new(
-                        new_context,
-                        previous_scaled_margin,
-                        self.config.split_color,
-                        self.config.split_active_color,
-                        self.config.panel,
-                    ));
+                        self.contexts[margin_source].scaled_margin;
+                    self.contexts.insert(
+                        insert_at,
+                        ContextGrid::new(
+                            new_context,
+                            previous_scaled_margin,
+                            self.config.split_color,
+                            self.config.split_active_color,
+                            self.config.panel,
+                        ),
+                    );
                     if redirect {
-                        self.current_index = last_index;
+                        self.current_index = insert_at;
                         self.current_route = self.current().route_id;
+                    } else if self.current_index >= insert_at {
+                        // Focus sat on a dock grid (or a tab at/after the
+                        // insertion point); keep it on the same grid.
+                        self.current_index += 1;
                     }
                 }
                 Err(..) => {
@@ -1202,8 +1456,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn keep_only_active_context_visible(&self, sugarloaf: &mut Sugarloaf) {
         for (idx, context) in self.contexts.iter().enumerate() {
-            // Skip the current tab
-            if idx == self.current_index {
+            // The focused tab and every dock pane stay visible; dock
+            // panes share the window with the active tab.
+            if idx == self.current_index || context.kind.is_dock() {
                 context.set_all_rich_text_visibility(sugarloaf, true);
                 continue;
             }
@@ -1221,7 +1476,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         new_index: usize,
     ) {
         if let Some(old_context) = self.contexts.get(old_index) {
-            old_context.set_all_rich_text_visibility(sugarloaf, false);
+            // Dock panes stay visible even when focus leaves them.
+            if !old_context.kind.is_dock() {
+                old_context.set_all_rich_text_visibility(sugarloaf, false);
+            }
         }
         if let Some(new_context) = self.contexts.get(new_index) {
             new_context.set_all_rich_text_visibility(sugarloaf, true);

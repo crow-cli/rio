@@ -225,6 +225,7 @@ impl Renderer {
                 named_colors.tabs_active,
                 config.navigation.hide_if_single,
                 config.navigation.max_tab_width,
+                config.apps.clone(),
             ))
         } else {
             None
@@ -440,20 +441,262 @@ impl Renderer {
         sugarloaf: &mut Sugarloaf,
         context_manager: &mut ContextManager<EventProxy>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
-        let mut any_panel_dirty = false;
-        let grid = context_manager.current_grid_mut();
-        let active_route = grid.current().route_id;
-        let grid_scaled_margin = grid.get_scaled_margin();
+        let active_route = context_manager.current().route_id;
         let mut has_active_changed = false;
         if self.last_active != Some(active_route) {
             has_active_changed = true;
             self.last_active = Some(active_route);
         }
 
+        // crowterm dock: dock panes share the window with the active
+        // tab, so they are snapshotted every frame as well — before the
+        // focused grid so the active tab's state settles last.
+        let mut any_panel_dirty = false;
+        let current_idx = context_manager.current_index();
+        let dock_indices: Vec<usize> = (0..context_manager.len())
+            .filter(|&i| {
+                i != current_idx && context_manager.contexts()[i].kind.is_dock()
+            })
+            .collect();
+        for idx in dock_indices {
+            any_panel_dirty |= self.snapshot_grid(
+                sugarloaf,
+                &mut context_manager.contexts_mut()[idx],
+                self.is_game_mode_enabled,
+            );
+        }
+
+        let grid = context_manager.current_grid_mut();
+        let grid_scaled_margin = grid.get_scaled_margin();
+        any_panel_dirty |= self.snapshot_grid(
+            sugarloaf,
+            grid,
+            has_active_changed || self.is_game_mode_enabled,
+        );
+
+        if self.scrollbar.is_enabled() {
+            self.scrollbar.clear_panel_states();
+            for grid_context in grid.contexts_mut().values() {
+                let panel_rect = grid_context.layout_rect;
+                let ctx = grid_context.context();
+                let rc = &ctx.renderable_content;
+                self.scrollbar
+                    .push_panel_state(scrollbar::PanelScrollState {
+                        rich_text_id: ctx.rich_text_id,
+                        panel_rect,
+                        display_offset: rc.display_offset,
+                        history_size: rc.history_size,
+                        screen_lines: rc.screen_lines,
+                    });
+            }
+        }
+
+        let window_size = sugarloaf.window_size();
+        let scale_factor = sugarloaf.scale_factor();
+
+        // Dim overlay for unfocused splits. Drawn after the split content is
+        // built so it composites on top. The tint comes from
+        // `unfocused_split_fill` (falling back to the terminal background)
+        // and its strength is `1.0 - unfocused_split_opacity`. Skipped
+        // entirely when the feature is disabled.
+        if self.unfocused_split_opacity < 1.0 {
+            let tint = self
+                .unfocused_split_fill
+                .unwrap_or(self.dynamic_background.0);
+            let dim_color = [
+                tint[0],
+                tint[1],
+                tint[2],
+                1.0 - self.unfocused_split_opacity,
+            ];
+            // Within-grid comparison: taffy keys are only meaningful
+            // inside a single tab's tree.
+            let active_key = grid.current;
+            for (key, grid_context) in grid.contexts_mut().iter() {
+                if &active_key == key {
+                    continue;
+                }
+                // Match the grid renderer's actual paint region —
+                // `.round()`ed integer-pixel origin +
+                // `cols * round(cell_w)` × `rows * round(cell_h)`
+                // content size (same math as `GridUniforms.grid_padding`
+                // / `cell_size` in `screen/mod.rs:~3717`). Using raw
+                // `layout_rect` leaves a sub-pixel un-dimmed fringe at
+                // the right/bottom edges of inactive splits because
+                // taffy allocates fractional sizes while the grid
+                // snaps to whole cells.
+                let dim = grid_context.val.dimension;
+                let cell_w = dim.cell.cell_width as f32;
+                let cell_h = dim.cell.cell_height as f32;
+                let cols = dim.columns.max(1) as f32;
+                let rows = dim.lines.max(1) as f32;
+                let panel_left =
+                    (grid_context.layout_rect[0] + grid_scaled_margin.left).round();
+                let panel_top =
+                    (grid_context.layout_rect[1] + grid_scaled_margin.top).round();
+                let x = panel_left / scale_factor;
+                let y = panel_top / scale_factor;
+                let w = (cols * cell_w) / scale_factor;
+                let h = (rows * cell_h) / scale_factor;
+                sugarloaf.rect(None, x, y, w, h, dim_color, 0.0, 3);
+            }
+        }
+
+        if let Some(island) = &mut self.island {
+            let island_bg = self
+                .last_window_bg
+                .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32])
+                .unwrap_or(self.named_colors.background.0);
+            island.render(
+                sugarloaf,
+                (window_size.width, window_size.height, scale_factor),
+                context_manager,
+                island_bg,
+            );
+        }
+
+        self.assistant.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.search.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        // The hint borrow (context_manager) and the draw target
+        // (sugarloaf) are disjoint, so the target text passes through
+        // by reference; nothing is cloned per hovered frame.
+        if let Some(hint) = context_manager
+            .current()
+            .renderable_content
+            .highlighted_hint
+            .as_ref()
+            .filter(|_| self.hint_click_would_land())
+        {
+            draw_hint_tooltip(
+                sugarloaf,
+                &hint.text,
+                (window_size.width, window_size.height),
+                scale_factor,
+            );
+        }
+
+        self.command_palette.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.confirm_quit.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        // Render scrollbars for each panel
+        let grid_scaled_margin_sb = context_manager.get_current_grid_scaled_margin();
+        let grid_margin_sb = (grid_scaled_margin_sb.left, grid_scaled_margin_sb.top);
+        let panel_count = self.scrollbar.panel_states().len();
+        for i in 0..panel_count {
+            let state = self.scrollbar.panel_states()[i];
+            self.scrollbar.render(
+                sugarloaf,
+                state.panel_rect,
+                scale_factor,
+                state.display_offset,
+                state.history_size,
+                state.screen_lines,
+                state.rich_text_id,
+                grid_margin_sb,
+            );
+        }
+
+        // Render panel borders (on top of terminal content). Borders
+        // are flat rects today — the previous `Object` enum
+        // (Rect / Quad / RichText) was only ever populated with the
+        // Rect variant, so the dispatch is direct now.
+        let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
+        for rect in context_manager.get_panel_borders() {
+            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
+            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
+            let width = rect.width / scale_factor;
+            let height = rect.height / scale_factor;
+            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
+        }
+
+        // crowterm dock pane separators — absolute window coordinates,
+        // drawn above terminal content like split borders.
+        for rect in
+            context_manager.get_dock_borders(window_size.width, window_size.height)
+        {
+            sugarloaf.rect(
+                None,
+                rect.x / scale_factor,
+                rect.y / scale_factor,
+                rect.width / scale_factor,
+                rect.height / scale_factor,
+                rect.color,
+                0.0,
+                2,
+            );
+        }
+
+        // Derive the window bg color from the currently-active panel's
+        // OSC 11 state (sticky on `renderable_content.background`) on
+        // every frame, not just the frame where OSC arrived. Without
+        // this, switching from a panel that ran OSC 11 to one that
+        // didn't keeps sugarloaf's bg stuck at the OSC color — we
+        // want it to follow focus the way does (each surface's
+        // `terminal.colors.background` drives its own window chrome).
+        let current_context = context_manager.current_grid_mut().current_mut();
+        let mut effective_bg = match &current_context.renderable_content.background {
+            Some(crate::context::renderable::BackgroundState::Set(color)) => *color,
+            // Explicit OSC 111 reset OR panel that never ran OSC 11 →
+            // fall back to the config / dynamic_background (honors
+            // window-opacity / background-image).
+            Some(crate::context::renderable::BackgroundState::Reset) | None => {
+                self.dynamic_background.1
+            }
+        };
+        // Re-apply the configured window-bg alpha. Without this, an
+        // OSC 11 sequence that sets a new bg color resets the alpha
+        // to 1.0 and the window goes opaque even when
+        // `window.opacity < 1`. Glass mode forces alpha 0 so the
+        // backdrop view shows through.
+        effective_bg.a = self.window_bg_alpha as f64;
+
+        let window_update = if self.last_window_bg != Some(effective_bg) {
+            sugarloaf.set_background_color(Some(effective_bg));
+            self.last_window_bg = Some(effective_bg);
+            // Native-window chrome (`setBackgroundColor` on macOS,
+            // titlebar color on Windows) follows the same value.
+            Some(crate::context::renderable::WindowUpdate::Background(
+                crate::context::renderable::BackgroundState::Set(effective_bg),
+            ))
+        } else {
+            None
+        };
+
+        (window_update, any_panel_dirty)
+    }
+
+    /// Per-grid snapshot pass: materializes each dirty panel's
+    /// terminal state into `renderable_content`, refreshes image
+    /// overlays and cursor blink. Returns whether any panel was
+    /// dirty. Shared by the focused tab and the crowterm dock
+    /// panes, which all render in the same frame.
+    fn snapshot_grid(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        grid: &mut crate::layout::ContextGrid<EventProxy>,
+        force_full_damage: bool,
+    ) -> bool {
+        let mut any_panel_dirty = false;
+        let grid_scaled_margin = grid.get_scaled_margin();
+
         for (_key, grid_context) in grid.contexts_mut().iter_mut() {
             let panel_rect = grid_context.layout_rect;
             let context = grid_context.context_mut();
-
             let mut has_ime = false;
             if let Some(preedit) = context.ime.preedit() {
                 if let Some(content) = preedit.text.chars().next() {
@@ -469,7 +712,6 @@ impl Renderer {
                     context.renderable_content.cursor.content_ref;
             }
 
-            let force_full_damage = has_active_changed || self.is_game_mode_enabled;
 
             let is_dirty = context.renderable_content.pending_update.is_dirty();
 
@@ -750,193 +992,7 @@ impl Renderer {
             }
         }
 
-        if self.scrollbar.is_enabled() {
-            self.scrollbar.clear_panel_states();
-            for grid_context in grid.contexts_mut().values() {
-                let panel_rect = grid_context.layout_rect;
-                let ctx = grid_context.context();
-                let rc = &ctx.renderable_content;
-                self.scrollbar
-                    .push_panel_state(scrollbar::PanelScrollState {
-                        rich_text_id: ctx.rich_text_id,
-                        panel_rect,
-                        display_offset: rc.display_offset,
-                        history_size: rc.history_size,
-                        screen_lines: rc.screen_lines,
-                    });
-            }
-        }
-
-        let window_size = sugarloaf.window_size();
-        let scale_factor = sugarloaf.scale_factor();
-
-        // Dim overlay for unfocused splits. Drawn after the split content is
-        // built so it composites on top. The tint comes from
-        // `unfocused_split_fill` (falling back to the terminal background)
-        // and its strength is `1.0 - unfocused_split_opacity`. Skipped
-        // entirely when the feature is disabled.
-        if self.unfocused_split_opacity < 1.0 {
-            let tint = self
-                .unfocused_split_fill
-                .unwrap_or(self.dynamic_background.0);
-            let dim_color = [
-                tint[0],
-                tint[1],
-                tint[2],
-                1.0 - self.unfocused_split_opacity,
-            ];
-            // Within-grid comparison: taffy keys are only meaningful
-            // inside a single tab's tree.
-            let active_key = grid.current;
-            for (key, grid_context) in grid.contexts_mut().iter() {
-                if &active_key == key {
-                    continue;
-                }
-                // Match the grid renderer's actual paint region —
-                // `.round()`ed integer-pixel origin +
-                // `cols * round(cell_w)` × `rows * round(cell_h)`
-                // content size (same math as `GridUniforms.grid_padding`
-                // / `cell_size` in `screen/mod.rs:~3717`). Using raw
-                // `layout_rect` leaves a sub-pixel un-dimmed fringe at
-                // the right/bottom edges of inactive splits because
-                // taffy allocates fractional sizes while the grid
-                // snaps to whole cells.
-                let dim = grid_context.val.dimension;
-                let cell_w = dim.cell.cell_width as f32;
-                let cell_h = dim.cell.cell_height as f32;
-                let cols = dim.columns.max(1) as f32;
-                let rows = dim.lines.max(1) as f32;
-                let panel_left =
-                    (grid_context.layout_rect[0] + grid_scaled_margin.left).round();
-                let panel_top =
-                    (grid_context.layout_rect[1] + grid_scaled_margin.top).round();
-                let x = panel_left / scale_factor;
-                let y = panel_top / scale_factor;
-                let w = (cols * cell_w) / scale_factor;
-                let h = (rows * cell_h) / scale_factor;
-                sugarloaf.rect(None, x, y, w, h, dim_color, 0.0, 3);
-            }
-        }
-
-        if let Some(island) = &mut self.island {
-            let island_bg = self
-                .last_window_bg
-                .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32])
-                .unwrap_or(self.named_colors.background.0);
-            island.render(
-                sugarloaf,
-                (window_size.width, window_size.height, scale_factor),
-                context_manager,
-                island_bg,
-            );
-        }
-
-        self.assistant.render(
-            sugarloaf,
-            (window_size.width, window_size.height, scale_factor),
-        );
-
-        self.search.render(
-            sugarloaf,
-            (window_size.width, window_size.height, scale_factor),
-        );
-
-        // The hint borrow (context_manager) and the draw target
-        // (sugarloaf) are disjoint, so the target text passes through
-        // by reference; nothing is cloned per hovered frame.
-        if let Some(hint) = context_manager
-            .current()
-            .renderable_content
-            .highlighted_hint
-            .as_ref()
-            .filter(|_| self.hint_click_would_land())
-        {
-            draw_hint_tooltip(
-                sugarloaf,
-                &hint.text,
-                (window_size.width, window_size.height),
-                scale_factor,
-            );
-        }
-
-        self.command_palette.render(
-            sugarloaf,
-            (window_size.width, window_size.height, scale_factor),
-        );
-
-        self.confirm_quit.render(
-            sugarloaf,
-            (window_size.width, window_size.height, scale_factor),
-        );
-
-        // Render scrollbars for each panel
-        let grid_scaled_margin_sb = context_manager.get_current_grid_scaled_margin();
-        let grid_margin_sb = (grid_scaled_margin_sb.left, grid_scaled_margin_sb.top);
-        let panel_count = self.scrollbar.panel_states().len();
-        for i in 0..panel_count {
-            let state = self.scrollbar.panel_states()[i];
-            self.scrollbar.render(
-                sugarloaf,
-                state.panel_rect,
-                scale_factor,
-                state.display_offset,
-                state.history_size,
-                state.screen_lines,
-                state.rich_text_id,
-                grid_margin_sb,
-            );
-        }
-
-        // Render panel borders (on top of terminal content). Borders
-        // are flat rects today — the previous `Object` enum
-        // (Rect / Quad / RichText) was only ever populated with the
-        // Rect variant, so the dispatch is direct now.
-        let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
-        for rect in context_manager.get_panel_borders() {
-            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
-            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
-            let width = rect.width / scale_factor;
-            let height = rect.height / scale_factor;
-            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
-        }
-
-        // Derive the window bg color from the currently-active panel's
-        // OSC 11 state (sticky on `renderable_content.background`) on
-        // every frame, not just the frame where OSC arrived. Without
-        // this, switching from a panel that ran OSC 11 to one that
-        // didn't keeps sugarloaf's bg stuck at the OSC color — we
-        // want it to follow focus the way does (each surface's
-        // `terminal.colors.background` drives its own window chrome).
-        let current_context = context_manager.current_grid_mut().current_mut();
-        let mut effective_bg = match &current_context.renderable_content.background {
-            Some(crate::context::renderable::BackgroundState::Set(color)) => *color,
-            // Explicit OSC 111 reset OR panel that never ran OSC 11 →
-            // fall back to the config / dynamic_background (honors
-            // window-opacity / background-image).
-            Some(crate::context::renderable::BackgroundState::Reset) | None => {
-                self.dynamic_background.1
-            }
-        };
-        // Re-apply the configured window-bg alpha. Without this, an
-        // OSC 11 sequence that sets a new bg color resets the alpha
-        // to 1.0 and the window goes opaque even when
-        // `window.opacity < 1`. Glass mode forces alpha 0 so the
-        // backdrop view shows through.
-        effective_bg.a = self.window_bg_alpha as f64;
-
-        let window_update = if self.last_window_bg != Some(effective_bg) {
-            sugarloaf.set_background_color(Some(effective_bg));
-            self.last_window_bg = Some(effective_bg);
-            // Native-window chrome (`setBackgroundColor` on macOS,
-            // titlebar color on Windows) follows the same value.
-            Some(crate::context::renderable::WindowUpdate::Background(
-                crate::context::renderable::BackgroundState::Set(effective_bg),
-            ))
-        } else {
-            None
-        };
-
-        (window_update, any_panel_dirty)
+        any_panel_dirty
     }
 
     /// Check if the renderer needs continuous redraw (for animations)

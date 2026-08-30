@@ -267,6 +267,8 @@ impl From<String> for Action {
             "movedividerleft" => Some(Action::MoveDividerLeft),
             "movedividerright" => Some(Action::MoveDividerRight),
             "togglevimode" => Some(Action::ToggleViMode),
+            "toggledocksidebar" => Some(Action::ToggleDockSidebar),
+            "toggledockbottom" => Some(Action::ToggleDockBottom),
             "toggleappearancetheme" => Some(Action::ToggleAppearanceTheme),
             "togglefullscreen" => Some(Action::ToggleFullscreen),
             "opencommandpalette" => Some(Action::OpenCommandPalette),
@@ -465,6 +467,10 @@ pub enum Action {
     /// Show or hide the quake-style dropdown window. Also registered
     /// as a system-wide hotkey when bound in `[bindings]`.
     ToggleQuake,
+    /// crowterm dock: toggle the filesystem sidebar (right).
+    ToggleDockSidebar,
+    /// crowterm dock: toggle the bottom terminal bar.
+    ToggleDockBottom,
 
     /// Scroll so the previous OSC 133 prompt is at the top of the
     /// viewport. Requires shell integration emitting semantic prompts.
@@ -1128,6 +1134,9 @@ pub fn platform_key_bindings(
         "n", ModifiersState::SUPER; Action::WindowCreateNew;
         ",", ModifiersState::SUPER; Action::ConfigEditor;
         "p", ModifiersState::SUPER | ModifiersState::SHIFT; Action::OpenCommandPalette;
+        // crowterm dock
+        "b", ModifiersState::SUPER | ModifiersState::SHIFT; Action::ToggleDockSidebar;
+        "j", ModifiersState::SUPER; Action::ToggleDockBottom;
 
         // Search
         "f", ModifiersState::SUPER, ~BindingMode::SEARCH; Action::SearchForward;
@@ -1210,6 +1219,9 @@ pub fn platform_key_bindings(
         "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::WindowCreateNew;
         ",", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ConfigEditor;
         "p", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::OpenCommandPalette;
+        // crowterm dock
+        "b", ModifiersState::SUPER | ModifiersState::SHIFT; Action::ToggleDockSidebar;
+        "j", ModifiersState::SUPER; Action::ToggleDockBottom;
 
         // Search
         "f", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH; Action::SearchForward;
@@ -1278,6 +1290,9 @@ pub fn platform_key_bindings(
         Key::Named(Backspace), ModifiersState::CONTROL, ~BindingMode::VI; Action::Esc("\u{0017}".into());
         Key::Named(Space), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleViMode;
         "p", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::OpenCommandPalette;
+        // crowterm dock
+        "b", ModifiersState::SUPER | ModifiersState::SHIFT; Action::ToggleDockSidebar;
+        "j", ModifiersState::SUPER; Action::ToggleDockBottom;
 
         // Search
         "f", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH; Action::SearchForward;

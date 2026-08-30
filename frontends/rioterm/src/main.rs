@@ -9,6 +9,7 @@ mod bindings;
 mod cli;
 mod constants;
 mod context;
+mod dock;
 mod global_hotkey;
 mod hints;
 mod ime;

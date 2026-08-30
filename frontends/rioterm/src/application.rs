@@ -704,7 +704,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             event_loop.exit();
                         }
                     } else {
-                        let size = route.window.screen.context_manager.len();
+                        let size = route.window.screen.context_manager.tab_count();
                         route.window.screen.resize_top_or_bottom_line(size);
                     }
                 }
@@ -1428,7 +1428,22 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             route.window.screen.mouse.hint_click_latched = latched;
                         }
 
-                        if route.window.screen.select_current_based_on_mouse() {
+                        // crowterm dock: a press inside a dock pane (sidebar /
+                        // bottom bar) focuses that pane's grid first, before
+                        // any split-level switching. Returns false when the
+                        // pane is already focused so the click still reaches
+                        // the terminal living in it.
+                        let dock_focused = {
+                            let screen = &mut route.window.screen;
+                            screen.focus_dock_pane_at(
+                                screen.mouse.x as f32,
+                                screen.mouse.y as f32,
+                            )
+                        };
+
+                        if dock_focused {
+                            route.request_redraw();
+                        } else if route.window.screen.select_current_based_on_mouse() {
                             route.request_redraw();
                         } else if !route.window.screen.modifiers.state().shift_key()
                             && !hint_click
@@ -1732,13 +1747,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_redraw();
                 }
 
+                // crowterm: highlight the hovered `[+]` dropdown entry.
+                if route.window.screen.update_dock_menu_hover(x, y) {
+                    route.request_redraw();
+                }
+
                 // The macOS full-size content view keeps this band as custom
                 // window chrome even when hide-if-single hides the island.
                 // Other platforms only reserve it while the island is drawn.
                 use crate::renderer::island::ISLAND_HEIGHT;
                 let scale_factor = route.window.screen.sugarloaf.scale_factor();
                 let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
-                let num_tabs = route.window.screen.ctx().len();
+                let num_tabs = route.window.screen.ctx().tab_count();
                 let nav = &route.window.screen.renderer.navigation;
                 if nav.chrome_band_reserved(num_tabs) && y <= island_height_px {
                     route.window.winit_window.set_cursor(CursorIcon::Default);

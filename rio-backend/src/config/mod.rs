@@ -61,6 +61,27 @@ where
     Ok(program.filter(|program| !program.is_empty()))
 }
 
+/// crowterm dock: one entry of the `[+]` "new pane" menu. Each app opens
+/// as a fresh terminal tab running `program` (with `args`) in the cwd of
+/// the focused tab.
+///
+/// ```toml
+/// [[apps]]
+/// label = "crow-cli"
+/// program = "crow-cli"
+///
+/// [[apps]]
+/// label = "new file — helix"
+/// program = "hx"
+/// ```
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct AppConfig {
+    pub label: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Scroll {
     pub multiplier: f64,
@@ -188,6 +209,9 @@ pub struct Config {
     pub scrollback_history_limit: usize,
     #[serde(default = "effects::Effects::default")]
     pub effects: effects::Effects,
+    /// crowterm dock: entries of the `[+]` "new pane" menu.
+    #[serde(default = "Vec::default")]
+    pub apps: Vec<AppConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -691,6 +715,7 @@ impl Default for Config {
             enable_scroll_bar: true,
             scrollback_history_limit: default_scrollback_history_limit(),
             effects: effects::Effects::default(),
+            apps: Vec::default(),
         }
     }
 }
@@ -1616,5 +1641,36 @@ mod tests {
         // Before applying platform overrides, should only have global env vars
         assert_eq!(result.env_vars.len(), 1);
         assert!(result.env_vars.contains(&String::from("GLOBAL=1")));
+    }
+
+    #[test]
+    fn test_apps_registry_parses() {
+        let result = create_temporary_config(
+            "apps",
+            r#"
+            [[apps]]
+            label = "crow-cli"
+            program = "crow-cli"
+
+            [[apps]]
+            label = "new file — helix"
+            program = "hx"
+            args = ["--health"]
+        "#,
+        );
+
+        assert_eq!(result.apps.len(), 2);
+        assert_eq!(result.apps[0].label, "crow-cli");
+        assert_eq!(result.apps[0].program, "crow-cli");
+        assert!(result.apps[0].args.is_empty());
+        assert_eq!(result.apps[1].label, "new file — helix");
+        assert_eq!(result.apps[1].program, "hx");
+        assert_eq!(result.apps[1].args, vec!["--health".to_string()]);
+    }
+
+    #[test]
+    fn test_apps_registry_defaults_empty() {
+        let result = create_temporary_config("apps-empty", "# no apps section");
+        assert!(result.apps.is_empty());
     }
 }

@@ -75,6 +75,19 @@ const CLOSE_ALPHA_HOVER: f32 = 0.95;
 const CLOSE_STROKE_WIDTH: f32 = 1.2;
 const INACTIVE_CUSTOM_MUTE: f32 = 0.55;
 
+/// crowterm `[+]` "new pane" menu. The strip reserves room for the
+/// button right of the last tab; the dropdown hangs below it.
+const PLUS_SIZE: f32 = 24.0;
+const PLUS_GAP: f32 = 8.0;
+const PLUS_GLYPH_SIZE: f32 = 14.0;
+const MENU_WIDTH: f32 = 250.0;
+const MENU_ITEM_HEIGHT: f32 = 30.0;
+const MENU_PADDING_Y: f32 = 5.0;
+const MENU_TEXT_PAD_X: f32 = 12.0;
+const MENU_TOP_GAP: f32 = 4.0;
+/// First dropdown entry always spawns a plain terminal tab.
+pub const MENU_NEW_TERMINAL_LABEL: &str = "New Terminal";
+
 struct TabDrag {
     // Index of the dragged tab, follows the tab as it reorders.
     tab_index: usize,
@@ -147,8 +160,13 @@ pub fn tab_strip_layout(
     #[cfg(not(target_os = "macos"))]
     let left_margin = 0.0;
 
-    let available_width =
-        (window_width / scale_factor) - ISLAND_MARGIN_RIGHT - left_margin;
+    // crowterm: the strip reserves room for the `[+]` button right of
+    // the last tab so tabs can never grow underneath it.
+    let available_width = (window_width / scale_factor)
+        - ISLAND_MARGIN_RIGHT
+        - left_margin
+        - PLUS_SIZE
+        - PLUS_GAP;
     let tab_width =
         (available_width / num_tabs.max(1) as f32).clamp(0.0, max_tab_width.max(0.0));
     TabStripLayout {
@@ -156,6 +174,13 @@ pub fn tab_strip_layout(
         tab_width,
         tabs_width: tab_width * num_tabs as f32,
     }
+}
+
+/// Rect (logical px) of the crowterm `[+]` button for a given strip layout.
+pub fn plus_button_rect(layout: &TabStripLayout) -> (f32, f32, f32, f32) {
+    let x = layout.left_margin + layout.tabs_width + PLUS_GAP;
+    let y = (ISLAND_HEIGHT - PLUS_SIZE) / 2.0;
+    (x, y, PLUS_SIZE, PLUS_SIZE)
 }
 
 struct IslandFills {
@@ -367,6 +392,11 @@ pub struct Island {
     /// Cursor is over the active island's close button — draws the
     /// hover backdrop. Updated on every cursor move by `Screen`.
     close_hover: bool,
+    /// crowterm `[+]` menu: open state, hovered entry, and the `[[apps]]`
+    /// registry (entry 0 is always the builtin "New Terminal").
+    menu_open: bool,
+    menu_hover: Option<usize>,
+    apps: Vec<rio_backend::config::AppConfig>,
 }
 
 impl Island {
@@ -375,6 +405,7 @@ impl Island {
         active_text_color: [f32; 4],
         hide_if_single: bool,
         max_tab_width: f32,
+        apps: Vec<rio_backend::config::AppConfig>,
     ) -> Self {
         Self {
             hide_if_single,
@@ -396,6 +427,96 @@ impl Island {
             slide_springs: FxHashMap::default(),
             last_anim_frame: Instant::now(),
             close_hover: false,
+            menu_open: false,
+            menu_hover: None,
+            apps,
+        }
+    }
+
+    /// crowterm `[+]` menu — entries are `MENU_NEW_TERMINAL_LABEL`
+    /// followed by the configured `[[apps]]`.
+    #[inline]
+    pub fn menu_entry_count(&self) -> usize {
+        1 + self.apps.len()
+    }
+
+    #[inline]
+    pub fn is_menu_open(&self) -> bool {
+        self.menu_open
+    }
+
+    #[inline]
+    pub fn open_menu(&mut self) {
+        self.menu_open = true;
+        self.menu_hover = None;
+    }
+
+    #[inline]
+    pub fn close_menu(&mut self) {
+        self.menu_open = false;
+        self.menu_hover = None;
+    }
+
+    /// The `[[apps]]` entry at `index` (0-based into the registry, NOT
+    /// the dropdown — the dropdown's entry 0 is the builtin terminal).
+    #[inline]
+    pub fn app(&self, index: usize) -> Option<&rio_backend::config::AppConfig> {
+        self.apps.get(index)
+    }
+
+    #[inline]
+    pub fn set_apps(&mut self, apps: Vec<rio_backend::config::AppConfig>) {
+        self.apps = apps;
+        if self.menu_hover.is_some_and(|h| h >= self.menu_entry_count()) {
+            self.menu_hover = None;
+        }
+    }
+
+    /// Update the hovered menu entry; returns true when it changed.
+    pub fn set_menu_hover(&mut self, hover: Option<usize>) -> bool {
+        if self.menu_hover != hover {
+            self.menu_hover = hover;
+            return true;
+        }
+        false
+    }
+
+    /// Dropdown panel rect (logical px) for the current strip layout.
+    fn menu_rect(&self, layout: &TabStripLayout) -> (f32, f32, f32, f32) {
+        let (px, _, pw, _) = plus_button_rect(layout);
+        let height = MENU_PADDING_Y * 2.0
+            + self.menu_entry_count() as f32 * MENU_ITEM_HEIGHT;
+        // Right-align under the button, clamped into the window.
+        let x = (px + pw - MENU_WIDTH).max(0.0);
+        (x, ISLAND_HEIGHT + MENU_TOP_GAP, MENU_WIDTH, height)
+    }
+
+    /// Which dropdown entry (if any) contains the logical-px point.
+    pub fn menu_item_at(&self, layout: &TabStripLayout, x: f32, y: f32) -> Option<usize> {
+        let (mx, my, mw, mh) = self.menu_rect(layout);
+        if x < mx || x > mx + mw || y < my || y > my + mh {
+            return None;
+        }
+        let idx = ((y - my - MENU_PADDING_Y) / MENU_ITEM_HEIGHT) as isize;
+        if idx >= 0 && (idx as usize) < self.menu_entry_count() {
+            Some(idx as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the logical-px point hits the `[+]` button.
+    pub fn plus_button_hit(&self, layout: &TabStripLayout, x: f32, y: f32) -> bool {
+        let (px, py, pw, ph) = plus_button_rect(layout);
+        x >= px && x <= px + pw && y >= py && y <= py + ph
+    }
+
+    /// Label for dropdown entry `index` (0 = builtin New Terminal).
+    pub fn menu_label(&self, index: usize) -> Cow<'_, str> {
+        if index == 0 {
+            Cow::Borrowed(MENU_NEW_TERMINAL_LABEL)
+        } else {
+            Cow::Borrowed(self.apps[index - 1].label.as_str())
         }
     }
 
@@ -738,7 +859,9 @@ impl Island {
         bg_color: [f32; 4],
     ) {
         let (window_width, _window_height, scale_factor) = dimensions;
-        let num_tabs = context_manager.len();
+        // Dock grids (crowterm sidebar/bottom bar) live at the tail of
+        // the context list and never appear in the tab strip.
+        let num_tabs = context_manager.tab_count();
         let current_tab_index = context_manager.current_index();
 
         // Immediate-mode: no cached ids to hide. If we early-return
@@ -1020,6 +1143,87 @@ impl Island {
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
                 ui.draw(text_x, text_y, &title, &title_opts);
+            }
+        }
+
+        // crowterm: the `[+]` "new pane" button, right of the tab strip.
+        let (plus_x, plus_y, plus_w, plus_h) = plus_button_rect(&layout);
+        draw_island(
+            sugarloaf,
+            plus_x,
+            plus_y,
+            plus_w,
+            plus_h,
+            TAB_RADIUS,
+            fills.inactive,
+            fills.outline,
+            Some(bg_color),
+            2,
+        );
+        {
+            let plus_opts = DrawOpts {
+                font_size: PLUS_GLYPH_SIZE,
+                color: color_u8(self.inactive_text_color),
+                ..DrawOpts::default()
+            };
+            let ui = sugarloaf.text_mut();
+            let glyph_w = ui.measure("+", &plus_opts);
+            ui.draw(
+                plus_x + (plus_w - glyph_w) / 2.0,
+                plus_y + (plus_h - PLUS_GLYPH_SIZE) / 2.0,
+                "+",
+                &plus_opts,
+            );
+        }
+
+        // The `[+]` dropdown hangs below the button, over the terminal.
+        if self.menu_open {
+            let (mx, my, mw, mh) = self.menu_rect(&layout);
+            let mut panel_bg = bg_color;
+            panel_bg[3] = 1.0;
+            let panel_fill = over(panel_bg, fills.inactive);
+            draw_island(
+                sugarloaf,
+                mx,
+                my,
+                mw,
+                mh,
+                TAB_RADIUS,
+                panel_fill,
+                fills.outline,
+                None,
+                20,
+            );
+            for entry in 0..self.menu_entry_count() {
+                let item_y = my + MENU_PADDING_Y + entry as f32 * MENU_ITEM_HEIGHT;
+                if self.menu_hover == Some(entry) {
+                    sugarloaf.rounded_rect(
+                        None,
+                        mx + 3.0,
+                        item_y + 1.0,
+                        mw - 6.0,
+                        MENU_ITEM_HEIGHT - 2.0,
+                        fills.inactive,
+                        0.06,
+                        TAB_RADIUS - 2.0,
+                        21,
+                    );
+                }
+                let max_w = mw - MENU_TEXT_PAD_X * 2.0;
+                let raw_label = self.menu_label(entry);
+                let label = fit_title_to_width(sugarloaf, &raw_label, max_w);
+                let label_opts = DrawOpts {
+                    font_size: TITLE_FONT_SIZE,
+                    color: color_u8(self.active_text_color),
+                    ..DrawOpts::default()
+                };
+                let ui = sugarloaf.text_mut();
+                ui.draw(
+                    mx + MENU_TEXT_PAD_X,
+                    item_y + (MENU_ITEM_HEIGHT - TITLE_FONT_SIZE) / 2.0,
+                    &label,
+                    &label_opts,
+                );
             }
         }
 
@@ -1580,7 +1784,7 @@ mod tests {
         let inactive_color = [0.5, 0.5, 0.5, 1.0];
         let active_color = [0.9, 0.9, 0.9, 1.0];
 
-        let island = Island::new(inactive_color, active_color, true, 240.0);
+        let island = Island::new(inactive_color, active_color, true, 240.0, Vec::new());
 
         assert_eq!(island.inactive_text_color, inactive_color);
         assert_eq!(island.active_text_color, active_color);
@@ -1590,12 +1794,12 @@ mod tests {
     #[test]
     fn test_island_height() {
         let island =
-            Island::new([0.8, 0.8, 0.8, 1.0], [1.0, 1.0, 1.0, 1.0], false, 240.0);
+            Island::new([0.8, 0.8, 0.8, 1.0], [1.0, 1.0, 1.0, 1.0], false, 240.0, Vec::new());
         assert_eq!(island.height(), ISLAND_HEIGHT);
     }
 
     fn test_island() -> Island {
-        Island::new([0.5, 0.5, 0.5, 1.0], [0.9, 0.9, 0.9, 1.0], false, 240.0)
+        Island::new([0.5, 0.5, 0.5, 1.0], [0.9, 0.9, 0.9, 1.0], false, 240.0, Vec::new())
     }
 
     #[test]
@@ -1795,14 +1999,15 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert_eq!(layout.left_margin, ISLAND_MARGIN_LEFT_MACOS);
-            assert_eq!(layout.tab_width, (500.0 - 8.0 - 76.0) / 4.0);
+            assert_eq!(layout.tab_width, (500.0 - 8.0 - 76.0 - 24.0 - 8.0) / 4.0);
             assert_eq!(layout.tabs_width, layout.tab_width * 4.0);
         }
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(layout.left_margin, 0.0);
-            assert_eq!(layout.tab_width, 123.0);
-            assert_eq!(layout.tabs_width, 492.0);
+            // 500 logical − 8 right margin − 24 plus button − 8 plus gap.
+            assert_eq!(layout.tab_width, 115.0);
+            assert_eq!(layout.tabs_width, 460.0);
         }
         // Zero tabs clamps the divisor.
         assert!(tab_strip_layout(1000.0, 2.0, 0, 240.0)
@@ -1977,5 +2182,107 @@ mod tests {
         assert!(island.progress_value.is_none());
         assert!(island.progress_started_at.is_none());
         assert!(island.progress_last_seen.is_none());
+    }
+
+    fn apps_island() -> Island {
+        let apps = vec![
+            rio_backend::config::AppConfig {
+                label: "crow-cli".to_string(),
+                program: "crow-cli".to_string(),
+                args: vec![],
+            },
+            rio_backend::config::AppConfig {
+                label: "helix".to_string(),
+                program: "hx".to_string(),
+                args: vec!["--health".to_string()],
+            },
+        ];
+        Island::new([0.5, 0.5, 0.5, 1.0], [0.9, 0.9, 0.9, 1.0], false, 240.0, apps)
+    }
+
+    #[test]
+    fn dock_menu_entry_count_and_labels() {
+        let island = apps_island();
+        // Builtin "New Terminal" + two configured apps.
+        assert_eq!(island.menu_entry_count(), 3);
+        assert_eq!(island.menu_label(0), MENU_NEW_TERMINAL_LABEL);
+        assert_eq!(island.menu_label(1), "crow-cli");
+        assert_eq!(island.menu_label(2), "helix");
+        let app = island.app(0).unwrap();
+        assert_eq!(app.program, "crow-cli");
+        let app = island.app(1).unwrap();
+        assert_eq!(app.args, vec!["--health".to_string()]);
+        assert!(island.app(2).is_none());
+    }
+
+    #[test]
+    fn dock_menu_open_close_and_hover() {
+        let mut island = apps_island();
+        assert!(!island.is_menu_open());
+        island.open_menu();
+        assert!(island.is_menu_open());
+        // Hover changes report true only on transition.
+        assert!(island.set_menu_hover(Some(1)));
+        assert!(!island.set_menu_hover(Some(1)));
+        island.close_menu();
+        assert!(!island.is_menu_open());
+        // Closing clears the hover.
+        assert!(island.menu_hover.is_none());
+    }
+
+    #[test]
+    fn dock_plus_button_sits_right_of_tabs() {
+        let layout = tab_strip_layout(1600.0, 2.0, 3, 240.0);
+        let (px, py, pw, ph) = plus_button_rect(&layout);
+        assert_eq!(px, layout.left_margin + layout.tabs_width + PLUS_GAP);
+        assert_eq!(pw, PLUS_SIZE);
+        assert_eq!(ph, PLUS_SIZE);
+        // Vertically centred inside the strip.
+        assert!(py > 0.0 && py + ph < ISLAND_HEIGHT);
+    }
+
+    #[test]
+    fn dock_plus_button_hit_test() {
+        let island = apps_island();
+        let layout = tab_strip_layout(1600.0, 2.0, 3, 240.0);
+        let (px, py, pw, ph) = plus_button_rect(&layout);
+        assert!(island.plus_button_hit(&layout, px + pw / 2.0, py + ph / 2.0));
+        // Just outside each edge.
+        assert!(!island.plus_button_hit(&layout, px - 1.0, py + ph / 2.0));
+        assert!(!island.plus_button_hit(&layout, px + pw + 1.0, py + ph / 2.0));
+        assert!(!island.plus_button_hit(&layout, px + pw / 2.0, py - 1.0));
+    }
+
+    #[test]
+    fn dock_menu_item_hit_test() {
+        let island = apps_island();
+        let layout = tab_strip_layout(1600.0, 2.0, 3, 240.0);
+        let (mx, my, mw, _mh) = island.menu_rect(&layout);
+        // Panel hangs below the strip.
+        assert!(my >= ISLAND_HEIGHT);
+        let cx = mx + mw / 2.0;
+        // Each entry occupies a MENU_ITEM_HEIGHT band after MENU_PADDING_Y.
+        for entry in 0..island.menu_entry_count() {
+            let y = my + MENU_PADDING_Y + entry as f32 * MENU_ITEM_HEIGHT + 1.0;
+            assert_eq!(island.menu_item_at(&layout, cx, y), Some(entry));
+        }
+        // Above the panel, below the last entry, and left of the panel miss.
+        assert_eq!(island.menu_item_at(&layout, cx, my - 1.0), None);
+        let below = my + MENU_PADDING_Y
+            + island.menu_entry_count() as f32 * MENU_ITEM_HEIGHT
+            + 5.0;
+        assert_eq!(island.menu_item_at(&layout, cx, below), None);
+        assert_eq!(island.menu_item_at(&layout, mx - 1.0, my + 5.0), None);
+    }
+
+    #[test]
+    fn dock_menu_set_apps_revalidates_hover() {
+        let mut island = apps_island();
+        island.open_menu();
+        island.set_menu_hover(Some(2));
+        // Shrinking the registry below the hovered index clears the hover.
+        island.set_apps(vec![]);
+        assert_eq!(island.menu_entry_count(), 1);
+        assert!(island.menu_hover.is_none());
     }
 }

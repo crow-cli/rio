@@ -73,6 +73,12 @@ pub struct Screen<'screen> {
     pub renderer: Renderer,
     pub sugarloaf: Sugarloaf<'screen>,
     pub context_manager: context::ContextManager<EventProxy>,
+    /// crowterm dock state (sidebar/bottom-bar visibility + fractions).
+    pub dock: crate::dock::DockState,
+    /// Config margins (scaled) without any dock contribution. The dock
+    /// adds to these for tab grids and derives pane placement from them.
+    /// `.top` is re-read live from the tab grid (island show/hide owns it).
+    dock_base_margin: Margin,
     last_ime_cursor_pos: Option<(f32, f32)>,
     hints_config: Vec<std::rc::Rc<rio_backend::config::hints::Hint>>,
     /// Hint regexes compiled on first use, keyed by pattern. Hover
@@ -320,7 +326,7 @@ impl Screen<'_> {
             sugarloaf.clear_background_image();
         }
 
-        Ok(Screen {
+        let mut screen = Screen {
             search_state: SearchState::default(),
             hint_state: HintState::new(config.hints.alphabet.clone()),
             hints_config: config
@@ -334,6 +340,8 @@ impl Screen<'_> {
             mouse_bindings: crate::bindings::default_mouse_bindings(),
             modifiers: Modifiers::default(),
             context_manager,
+            dock: crate::dock::DockState::default(),
+            dock_base_margin: scaled_margin,
             sugarloaf,
             mouse: Mouse::new(config.scroll.multiplier, config.scroll.divider),
             touchpurpose: TouchPurpose::default(),
@@ -347,7 +355,11 @@ impl Screen<'_> {
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
-        })
+        };
+
+        screen.spawn_initial_dock_panes();
+
+        Ok(screen)
     }
 
     #[inline]
@@ -447,7 +459,7 @@ impl Screen<'_> {
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         should_update_font_library: bool,
     ) {
-        let num_tabs = self.ctx().len();
+        let num_tabs = self.context_manager.tab_count();
         let padding_y_top = padding_top_from_config(
             &config.navigation,
             config.margin.top,
@@ -487,6 +499,7 @@ impl Screen<'_> {
         if let Some(mut island) = old_island {
             island.update_colors(config.colors.tabs, config.colors.tabs_active);
             island.max_tab_width = config.navigation.max_tab_width;
+            island.set_apps(config.apps.clone());
             self.renderer.island = Some(island);
         }
 
@@ -591,11 +604,10 @@ impl Screen<'_> {
             self.clear_selection();
         }
         self.sugarloaf.resize(new_size.width, new_size.height);
-        let width = new_size.width as f32;
-        let height = new_size.height as f32;
 
-        self.context_manager
-            .resize_all_grids(width, height, &mut self.sugarloaf);
+        // Dock-aware relayout: recomputes dock margins from the new
+        // window size, then resizes every grid (tabs + dock panes).
+        self.relayout_dock();
 
         // A resize reflows the cursor; that displacement is layout,
         // not travel, and must not animate a smear.
@@ -628,8 +640,18 @@ impl Screen<'_> {
         new_scale: f32,
         new_size: rio_window::dpi::PhysicalSize<u32>,
     ) -> &mut Self {
+        let prev_scale = self.sugarloaf.scale_factor().max(f32::EPSILON);
         self.sugarloaf.rescale(new_scale);
         self.sugarloaf.resize(new_size.width, new_size.height);
+
+        // Keep the dock-free base margin in step with the DPI change.
+        let ratio = new_scale / prev_scale;
+        self.dock_base_margin = Margin::new(
+            self.dock_base_margin.top * ratio,
+            self.dock_base_margin.right * ratio,
+            self.dock_base_margin.bottom * ratio,
+            self.dock_base_margin.left * ratio,
+        );
 
         for context_grid in self.context_manager.contexts_mut() {
             let old_scale = context_grid.current().dimension.dimension.scale.max(1.0);
@@ -664,11 +686,8 @@ impl Screen<'_> {
             context_grid.update_dimensions(&mut self.sugarloaf);
         }
 
-        let width = new_size.width as f32;
-        let height = new_size.height as f32;
-
-        self.context_manager
-            .resize_all_grids(width, height, &mut self.sugarloaf);
+        // Dock-aware relayout resizes every grid with fresh margins.
+        self.relayout_dock();
         self.mark_dirty();
         // Rescaled cursor displacement is layout, not travel.
         self.renderer.trail_cursor.snap();
@@ -692,6 +711,232 @@ impl Screen<'_> {
                 let _ = ctx.messenger.send_resize(winsize);
             }
         }
+    }
+
+    // ── crowterm dock ────────────────────────────────────────────────
+    //
+    // The dock reserves a filesystem sidebar (right) and a terminal bar
+    // (bottom) around the main tab area. Each is a real PTY grid at the
+    // tail of the ContextManager; placement is done purely through each
+    // grid's `scaled_margin`, so the existing taffy/resize/render paths
+    // carry them without a second layout system.
+
+    #[inline]
+    fn window_physical_size(&self) -> (f32, f32) {
+        let size = self.sugarloaf.window_size();
+        (size.width, size.height)
+    }
+
+    /// Spawn a dock pane (sidebar/bottom) if not already present.
+    /// Returns true when the pane exists afterwards.
+    fn spawn_dock_pane(&mut self, kind: context::GridKind) -> bool {
+        if self.context_manager.dock_index(kind).is_some() {
+            return true;
+        }
+
+        // The sidebar yazi gets a stable per-window DDS client id so tab
+        // focus changes can drive it (`ya emit-to <id> cd <cwd>`).
+        let mut yazi_id: Option<String> = None;
+        let program = match kind {
+            context::GridKind::Sidebar => {
+                let id = crate::dock::yazi_client_id(u64::from(
+                    self.context_manager.window_id(),
+                ));
+                let args = vec!["--client-id".to_string(), id.clone()];
+                yazi_id = Some(id);
+                Some((crate::dock::SIDEBAR_PROGRAM.to_string(), args))
+            }
+            context::GridKind::BottomBar => None, // default shell
+            context::GridKind::Tab => return false,
+        };
+
+        let rich_text_id = next_rich_text_id();
+        let dimension = self.context_manager.current().dimension;
+        let scaled_margin = self.context_manager.current_grid().scaled_margin;
+
+        match self.context_manager.spawn_dock_grid(
+            kind,
+            program,
+            rich_text_id,
+            scaled_margin,
+            dimension,
+        ) {
+            Ok(_) => {
+                // Wire the filesystem sidebar to follow tab focus.
+                if let Some(id) = yazi_id {
+                    if let Some(ya_bin) = crate::dock::resolve_ya() {
+                        self.context_manager.register_dock_yazi(id, ya_bin);
+                    } else {
+                        tracing::warn!("`ya` CLI not found; sidebar yazi will not follow tab focus");
+                    }
+                }
+                true
+            }
+            Err(err) => {
+                tracing::error!("unable to spawn dock pane {:?}: {err}", kind);
+                false
+            }
+        }
+    }
+
+    /// Spawn the dock panes that should be visible at startup.
+    pub fn spawn_initial_dock_panes(&mut self) {
+        let sidebar = self.dock.sidebar_visible;
+        let bottom = self.dock.bottom_visible;
+        if sidebar && !self.spawn_dock_pane(context::GridKind::Sidebar) {
+            self.dock.sidebar_visible = false;
+        }
+        if bottom && !self.spawn_dock_pane(context::GridKind::BottomBar) {
+            self.dock.bottom_visible = false;
+        }
+        self.relayout_dock();
+    }
+
+    /// Recompute every grid's margins from the dock state and re-run the
+    /// layout pass. Tab grids shrink away from the visible dock panes; the
+    /// dock grids get margins that place them in their reserved region.
+    pub fn relayout_dock(&mut self) {
+        let (w, h) = self.window_physical_size();
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+
+        let sidebar_w = self.dock.sidebar_width(w);
+        let bottom_h = self.dock.bottom_height(h);
+
+        // Island show/hide owns the top margin; read it live from a tab.
+        let base_top = self
+            .context_manager
+            .contexts()
+            .iter()
+            .find(|g| g.kind == context::GridKind::Tab)
+            .map(|g| g.scaled_margin.top)
+            .unwrap_or(self.dock_base_margin.top);
+        let base_left = self.dock_base_margin.left;
+        let base_right = self.dock_base_margin.right;
+        let base_bottom = self.dock_base_margin.bottom;
+
+        for context_grid in self.context_manager.contexts_mut() {
+            let margin = match context_grid.kind {
+                context::GridKind::Tab => Margin::new(
+                    base_top,
+                    base_right + sidebar_w,
+                    base_bottom + bottom_h,
+                    base_left,
+                ),
+                context::GridKind::Sidebar => {
+                    Margin::new(base_top, 0.0, bottom_h, w - sidebar_w)
+                }
+                context::GridKind::BottomBar => {
+                    Margin::new(h - bottom_h, 0.0, 0.0, 0.0)
+                }
+            };
+            context_grid.update_scaled_margin(margin);
+            context_grid.update_dimensions(&mut self.sugarloaf);
+        }
+
+        self.context_manager
+            .resize_all_grids(w, h, &mut self.sugarloaf);
+        self.mark_dirty();
+        // Dock reflow displaces every cursor; suppress trail smears.
+        self.renderer.trail_cursor.snap();
+    }
+
+    /// Toggle the filesystem sidebar.
+    pub fn toggle_dock_sidebar(&mut self) {
+        if self.dock.sidebar_visible {
+            self.dock.sidebar_visible = false;
+        } else {
+            self.dock.sidebar_visible = true;
+            if !self.spawn_dock_pane(context::GridKind::Sidebar) {
+                self.dock.sidebar_visible = false;
+            }
+        }
+        // Focus must not sit on a pane that just disappeared.
+        if !self.dock.sidebar_visible
+            && self.context_manager.current_grid().kind
+                == context::GridKind::Sidebar
+        {
+            if self.context_manager.tab_count() > 0 {
+                self.context_manager
+                    .set_current(self.context_manager.tab_count() - 1);
+            }
+        }
+        self.relayout_dock();
+    }
+
+    /// Toggle the bottom terminal bar.
+    pub fn toggle_dock_bottom(&mut self) {
+        if self.dock.bottom_visible {
+            self.dock.bottom_visible = false;
+        } else {
+            self.dock.bottom_visible = true;
+            if !self.spawn_dock_pane(context::GridKind::BottomBar) {
+                self.dock.bottom_visible = false;
+            }
+        }
+        if !self.dock.bottom_visible
+            && self.context_manager.current_grid().kind
+                == context::GridKind::BottomBar
+        {
+            if self.context_manager.tab_count() > 0 {
+                self.context_manager
+                    .set_current(self.context_manager.tab_count() - 1);
+            }
+        }
+        self.relayout_dock();
+    }
+
+    /// Hit-test a physical-pixel position against the visible dock panes.
+    /// Used to move focus when the user clicks into the sidebar/bottom.
+    pub fn dock_pane_at(&self, x: f32, y: f32) -> Option<context::GridKind> {
+        let (w, h) = self.window_physical_size();
+        let sidebar_w = self.dock.sidebar_width(w);
+        let bottom_h = self.dock.bottom_height(h);
+
+        // Bottom bar spans the full width below everything.
+        if self.dock.bottom_visible && y >= h - bottom_h {
+            return Some(context::GridKind::BottomBar);
+        }
+        // Sidebar starts below the Island tab strip; a click up there is a
+        // tab-bar click, not a sidebar click.
+        let island_top = self
+            .context_manager
+            .contexts()
+            .iter()
+            .find(|g| g.kind == context::GridKind::Tab)
+            .map(|g| g.scaled_margin.top)
+            .unwrap_or(self.dock_base_margin.top);
+        if self.dock.sidebar_visible && x >= w - sidebar_w && y >= island_top {
+            return Some(context::GridKind::Sidebar);
+        }
+        None
+    }
+
+    /// Focus the dock pane under (x, y) if any; returns true when focus
+    /// moved so callers can skip their normal click handling.
+    pub fn focus_dock_pane_at(&mut self, x: f32, y: f32) -> bool {
+        let Some(kind) = self.dock_pane_at(x, y) else {
+            return false;
+        };
+        let Some(idx) = self.context_manager.dock_index(kind) else {
+            return false;
+        };
+        // Only consume the click when focus actually moved; a click in the
+        // already-focused dock pane must fall through to the terminal that
+        // lives in it (yazi / shell).
+        if self.context_manager.current_index() == idx {
+            return false;
+        }
+        let old = self.context_manager.current_index();
+        self.context_manager
+            .switch_context_visibility(&mut self.sugarloaf, old, idx);
+        self.context_manager.set_current(idx);
+        // A focusing click must not drag-extend a stale selection left in
+        // the target pane (mirrors select_current_based_on_mouse).
+        self.clear_selection();
+        self.mark_dirty();
+        true
     }
 
     #[inline]
@@ -1030,40 +1275,40 @@ impl Screen<'_> {
                     }
                     Act::SearchForward => {
                         self.start_search(Direction::Right);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::SearchBackward => {
                         self.start_search(Direction::Left);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchConfirm) => {
                         self.confirm_search(clipboard);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchCancel) => {
                         self.cancel_search(clipboard);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchClear) => {
                         let direction = self.search_state.direction;
                         self.cancel_search(clipboard);
                         self.start_search(direction);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchFocusNext) => {
                         self.advance_search_origin(self.search_state.direction);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchFocusPrevious) => {
                         let direction = self.search_state.direction.opposite();
                         self.advance_search_origin(direction);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchDeleteWord) => {
@@ -1221,6 +1466,12 @@ impl Screen<'_> {
                     Act::ToggleQuake => {
                         self.context_manager.toggle_quake();
                     }
+                    Act::ToggleDockSidebar => {
+                        self.toggle_dock_sidebar();
+                    }
+                    Act::ToggleDockBottom => {
+                        self.toggle_dock_bottom();
+                    }
                     Act::CloseCurrentSplitOrTab => {
                         self.close_split_or_tab(clipboard);
                     }
@@ -1233,7 +1484,7 @@ impl Screen<'_> {
                     Act::TabCloseUnfocused => {
                         self.clear_selection();
                         self.cancel_search(clipboard);
-                        if self.ctx().len() <= 1 {
+                        if self.context_manager.tab_count() <= 1 {
                             return true;
                         }
                         self.context_manager
@@ -1488,7 +1739,7 @@ impl Screen<'_> {
                             new_index,
                         );
                         let tab_width =
-                            self.island_tab_layout(self.context_manager.len()).tab_width;
+                            self.island_tab_layout(self.context_manager.tab_count()).tab_width;
                         if let Some(ref mut island) = self.renderer.island {
                             island.remap_tab_swap(old_index, new_index, tab_width);
                         }
@@ -1506,7 +1757,7 @@ impl Screen<'_> {
                             new_index,
                         );
                         let tab_width =
-                            self.island_tab_layout(self.context_manager.len()).tab_width;
+                            self.island_tab_layout(self.context_manager.tab_count()).tab_width;
                         if let Some(ref mut island) = self.renderer.island {
                             island.remap_tab_swap(old_index, new_index, tab_width);
                         }
@@ -1616,11 +1867,39 @@ impl Screen<'_> {
     }
 
     pub fn create_tab(&mut self, clipboard: &mut Clipboard) {
+        self.spawn_tab_with_program(clipboard, None);
+    }
+
+    /// crowterm `[+]` menu: spawn a new tab for dropdown entry `entry`
+    /// (0 = builtin New Terminal, n = `[[apps]]` entry n−1). The tab
+    /// inherits the focused tab's live cwd.
+    pub fn spawn_app_tab(&mut self, entry: usize, clipboard: &mut Clipboard) {
+        let program = if entry == 0 {
+            None
+        } else {
+            match self
+                .renderer
+                .island
+                .as_ref()
+                .and_then(|island| island.app(entry - 1))
+            {
+                Some(app) => Some((app.program.clone(), app.args.clone())),
+                None => return,
+            }
+        };
+        self.spawn_tab_with_program(clipboard, program);
+    }
+
+    fn spawn_tab_with_program(
+        &mut self,
+        clipboard: &mut Clipboard,
+        program: Option<(String, Vec<String>)>,
+    ) {
         let redirect = true;
 
         // We resize the current tab ahead to prepare the
         // dimensions to be copied to next tab.
-        let num_tabs = self.ctx().len();
+        let num_tabs = self.context_manager.tab_count();
         let old_index = self.context_manager.current_index();
         self.resize_top_or_bottom_line(num_tabs + 1);
 
@@ -1630,13 +1909,9 @@ impl Screen<'_> {
         self.context_manager.contexts_mut()[old_index]
             .update_dimensions(&mut self.sugarloaf);
 
-        // Allocate panel id; the layout pass handles positioning via
-        // `ContextDimension` once the new tab's grid is built.
-        let _ = self.context_manager.current_grid().scaled_margin.left;
-        let _ = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
-        self.context_manager.add_context(redirect, rich_text_id);
+        self.context_manager
+            .add_context_with_program(redirect, rich_text_id, program);
         let new_index = self.context_manager.current_index();
         self.context_manager.switch_context_visibility(
             &mut self.sugarloaf,
@@ -1668,7 +1943,7 @@ impl Screen<'_> {
         }
 
         self.cancel_search(clipboard);
-        if self.ctx().len() <= 1 {
+        if self.context_manager.tab_count() <= 1 {
             // Update the remaining tab's margin and position
             // (on Linux/Windows when hide_if_single transitions to hidden)
             #[cfg(not(target_os = "macos"))]
@@ -1681,7 +1956,7 @@ impl Screen<'_> {
             }
             return;
         }
-        let num_tabs = self.ctx().len();
+        let num_tabs = self.context_manager.tab_count();
         self.resize_top_or_bottom_line(num_tabs);
         self.mark_dirty();
     }
@@ -1728,6 +2003,10 @@ impl Screen<'_> {
             ));
             context_grid.update_dimensions(&mut self.sugarloaf);
         }
+
+        // The island moving also moves the dock (sidebar top derives
+        // from it); recompute every dock margin from scratch.
+        self.relayout_dock();
 
         // The tab strip appearing or vanishing shifts every panel;
         // a background tab can close without a route change, so this
@@ -2542,7 +2821,7 @@ impl Screen<'_> {
                     }
                     SearchOverlayAction::Close => {
                         self.cancel_search(clipboard);
-                        self.resize_top_or_bottom_line(self.ctx().len());
+                        self.resize_top_or_bottom_line(self.context_manager.tab_count());
                     }
                 }
                 self.mark_dirty();
@@ -2804,8 +3083,30 @@ impl Screen<'_> {
         changed
     }
 
+    /// crowterm: hover feedback for the open `[+]` dropdown. Returns
+    /// true when the hovered entry changed (caller redraws).
+    pub fn update_dock_menu_hover(&mut self, mouse_x: f64, mouse_y: f64) -> bool {
+        if self
+            .renderer
+            .island
+            .as_ref()
+            .is_none_or(|island| !island.is_menu_open())
+        {
+            return false;
+        }
+        let scale = self.sugarloaf.scale_factor();
+        let layout = self.island_tab_layout(self.context_manager.tab_count());
+        let island = self.renderer.island.as_mut().expect("checked above");
+        let hover = island.menu_item_at(
+            &layout,
+            mouse_x as f32 / scale,
+            mouse_y as f32 / scale,
+        );
+        island.set_menu_hover(hover)
+    }
+
     pub fn update_close_button_hover(&mut self, mouse_x: f64, mouse_y: f64) -> bool {
-        let num_tabs = self.context_manager.len();
+        let num_tabs = self.context_manager.tab_count();
         let scale_factor = self.sugarloaf.scale_factor();
 
         let hovering = num_tabs > 1
@@ -2844,7 +3145,7 @@ impl Screen<'_> {
         let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
 
         let window_width = self.sugarloaf.window_size().width;
-        let num_tabs = self.context_manager.len();
+        let num_tabs = self.context_manager.tab_count();
         let island_visible = self.renderer.navigation.island_visible(num_tabs);
 
         if let Some(ref mut island) = self.renderer.island {
@@ -2862,6 +3163,39 @@ impl Screen<'_> {
                     return true;
                 }
             }
+        }
+
+        // crowterm `[+]` menu: while open it captures every press — an
+        // item spawns its app, anything else dismisses. Runs before the
+        // island-band cutoff because the dropdown hangs below the strip.
+        // Outer Option: menu open? Inner: which entry (if any).
+        let menu_press = if let Some(ref island) = self.renderer.island {
+            if island.is_menu_open() {
+                if is_right_click {
+                    Some(None)
+                } else {
+                    let layout = self.island_tab_layout(num_tabs);
+                    Some(island.menu_item_at(
+                        &layout,
+                        mouse_x as f32 / scale_factor,
+                        mouse_y as f32 / scale_factor,
+                    ))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(entry) = menu_press {
+            if let Some(ref mut island) = self.renderer.island {
+                island.close_menu();
+            }
+            self.mark_dirty();
+            if let Some(entry) = entry {
+                self.spawn_app_tab(entry, clipboard);
+            }
+            return true;
         }
 
         // Check if click is within island height
@@ -2909,6 +3243,21 @@ impl Screen<'_> {
 
         let layout = self.island_tab_layout(num_tabs);
         let x_in_tabs = mouse_x_unscaled - layout.left_margin;
+
+        // crowterm: the `[+]` button right of the tabs opens the menu.
+        if !is_right_click {
+            if let Some(ref mut island) = self.renderer.island {
+                if island.plus_button_hit(
+                    &layout,
+                    mouse_x_unscaled,
+                    mouse_y as f32 / scale_factor,
+                ) {
+                    island.open_menu();
+                    self.mark_dirty();
+                    return true;
+                }
+            }
+        }
 
         if !is_right_click
             && self.is_close_press_tail(mouse_x_unscaled)
@@ -3032,7 +3381,7 @@ impl Screen<'_> {
     }
 
     pub fn handle_tab_drag_move(&mut self, x_unscaled: f32) {
-        let num_tabs = self.context_manager.len();
+        let num_tabs = self.context_manager.tab_count();
 
         // A tab closed mid-drag invalidates the armed indices.
         if num_tabs < 2 {
@@ -3085,7 +3434,7 @@ impl Screen<'_> {
     }
 
     pub fn handle_tab_drag_release(&mut self) -> bool {
-        let num_tabs = self.context_manager.len();
+        let num_tabs = self.context_manager.tab_count();
         let layout = self.island_tab_layout(num_tabs);
 
         if let Some(ref mut island) = self.renderer.island {
@@ -3702,7 +4051,7 @@ impl Screen<'_> {
             PaletteAction::TabCreate => self.create_tab(clipboard),
             PaletteAction::TabClose => self.close_tab(clipboard),
             PaletteAction::TabCloseUnfocused => {
-                if self.ctx().len() > 1 {
+                if self.context_manager.tab_count() > 1 {
                     self.context_manager
                         .close_unfocused_tabs(&mut self.sugarloaf);
                     if let Some(ref mut island) = self.renderer.island {
@@ -4000,21 +4349,41 @@ impl Screen<'_> {
                     rio_backend::crosswords::pos::Pos,
                 )>,
                 hint_labels: Option<Vec<crate::context::renderable::HintLabel>>,
+                /// The owning grid's scaled margin — the panel's paint
+                /// origin offset (dock panes carry their own margins).
+                grid_margin: Margin,
             }
 
-            let (active_key, scaled_margin) = {
-                let grid = self.context_manager.current_grid();
-                (grid.current, grid.scaled_margin)
-            };
             // Snapshot the window's focused search match before the
             // per-context borrow below. `search_state` lives on
             // `Screen`, so we can't reach for it from inside the
             // `contexts_mut` iteration.
             let search_focused_match = self.search_state.focused_match.clone();
             let mut panels: Vec<PanelFrame> = Vec::new();
-            for (key, item) in self
-                .context_manager
-                .current_grid_mut()
+
+            // crowterm dock: emit the focused tab's panels plus every
+            // dock pane's. Focused grid first, dock grids after.
+            let current_idx = self.context_manager.current_index();
+            let mut grid_order: Vec<usize> = vec![current_idx];
+            for i in 0..self.context_manager.len() {
+                let grid = &self.context_manager.contexts()[i];
+                // Skip hidden dock panes (zero-size); toggling a pane off
+                // must not leave a phantom snapshot behind.
+                if i != current_idx
+                    && grid.kind.is_dock()
+                    && self.dock.grid_is_expected(grid.kind)
+                {
+                    grid_order.push(i);
+                }
+            }
+
+            for grid_idx in grid_order {
+            let is_current_grid = grid_idx == current_idx;
+            let (active_key, scaled_margin) = {
+                let grid = &self.context_manager.contexts()[grid_idx];
+                (grid.current, grid.scaled_margin)
+            };
+            for (key, item) in self.context_manager.contexts_mut()[grid_idx]
                 .contexts_mut()
                 .iter_mut()
             {
@@ -4064,7 +4433,7 @@ impl Screen<'_> {
                     rio_backend::event::TerminalDamage::Noop,
                 );
                 let hint_matches = ctx.renderable_content.hint_matches.clone();
-                let is_active = *key == active_key;
+                let is_active = is_current_grid && *key == active_key;
                 // `focused_match` lives on `Screen::search_state` — it's
                 // a per-window state tied to whichever panel has search
                 // focus, which is the active one. Don't paint a focused
@@ -4132,7 +4501,9 @@ impl Screen<'_> {
                     focused_match,
                     hovered_hyperlink,
                     hint_labels,
+                    grid_margin: scaled_margin,
                 });
+            }
             }
 
             // --- ensure every panel has a matching GridRenderer ---
@@ -4432,8 +4803,8 @@ impl Screen<'_> {
                 // `floor((pixel - padding) / cell_size)` disagrees
                 // with the text vertex's `cell_size * grid_pos`
                 // about where cell boundaries are → visible seams.
-                let panel_left = (scaled_margin.left + p.layout_rect[0]).round();
-                let panel_top = (scaled_margin.top + p.layout_rect[1]).round();
+                let panel_left = (p.grid_margin.left + p.layout_rect[0]).round();
+                let panel_top = (p.grid_margin.top + p.layout_rect[1]).round();
 
                 // Bg-tint uniforms fire ONLY for the active block
                 // style — the bg shader paints the cursor cell in

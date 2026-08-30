@@ -17,6 +17,28 @@ use taffy::{
 const MIN_COLS: usize = 2;
 const MIN_LINES: usize = 1;
 
+/// Role a grid plays in the crowterm dock. Regular tabs are `Tab`;
+/// dock panes (filesystem sidebar, bottom terminal bar) live at the
+/// tail of the manager's context list, out of the tab strip. They are
+/// real PTY grids — "the protocol is the terminal" — just addressed
+/// by the dock instead of by a tab index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridKind {
+    #[default]
+    Tab,
+    /// Filesystem sidebar docked on the right (yazi).
+    Sidebar,
+    /// Bottom terminal bar (shell drawer).
+    BottomBar,
+}
+
+impl GridKind {
+    #[inline]
+    pub fn is_dock(&self) -> bool {
+        !matches!(self, GridKind::Tab)
+    }
+}
+
 /// Direction of a draggable panel border
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BorderDirection {
@@ -114,6 +136,8 @@ pub struct ContextGrid<T: EventListener> {
     pub custom_title: Option<String>,
     // custom_color is the tab's background override (tab color picker).
     pub custom_color: Option<[f32; 4]>,
+    /// Dock role of this grid (tab vs. sidebar vs. bottom bar).
+    pub kind: GridKind,
     scale: f32,
     inner: FxHashMap<NodeId, ContextGridItem<T>>,
     pub root: Option<NodeId>,
@@ -121,6 +145,8 @@ pub struct ContextGrid<T: EventListener> {
     tree: TaffyTree<()>,
     root_node: NodeId,
     border_config: BorderConfig,
+    /// Border color for the pane holding focus (crowterm dock outline).
+    border_active_color: [f32; 4],
 }
 
 pub struct ContextGridItem<T: EventListener> {
@@ -158,7 +184,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         context: Context<T>,
         scaled_margin: Margin,
         border_color: [f32; 4],
-        _border_active_color: [f32; 4],
+        border_active_color: [f32; 4],
         panel_config: rio_backend::config::layout::Panel,
     ) -> Self {
         let width = context.dimension.width;
@@ -229,6 +255,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             scaled_margin,
             custom_title: None,
             custom_color: None,
+            kind: GridKind::Tab,
             scale,
             width,
             height,
@@ -237,9 +264,17 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             tree,
             root_node,
             border_config,
+            border_active_color,
         };
         grid.calculate_positions();
         grid
+    }
+
+    /// Override the dock role (default is `GridKind::Tab`).
+    #[inline]
+    pub fn with_kind(mut self, kind: GridKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     #[inline]
@@ -270,6 +305,22 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     pub fn should_draw_borders(&self) -> bool {
         self.panel_count() > 1
+    }
+
+    /// crowterm: border styling accessors for the dock outline.
+    #[inline]
+    pub fn border_color(&self) -> [f32; 4] {
+        self.border_config.color
+    }
+
+    #[inline]
+    pub fn border_active_color(&self) -> [f32; 4] {
+        self.border_active_color
+    }
+
+    #[inline]
+    pub fn border_width(&self) -> f32 {
+        self.border_config.width
     }
 
     fn try_update_size(&mut self, width: f32, height: f32) -> Result<(), TaffyError> {

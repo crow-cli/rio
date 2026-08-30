@@ -8,7 +8,7 @@ Install: `cargo install --path frontends/rioterm --features wgpu,audio --force`
 Test gate: `cargo test -p rioterm -p rio-backend` + live eyeball (this is UI work)
 Upstream: `upstream` = raphamorim/rio, `origin` = crow-cli/rio (our fork)
 
-## Phase 1 — Recon + design doc
+## Phase 1 — Recon + design doc ✅ DONE 29Aug2026 (f758fca9c7)
 1.1 Write `docs/crowterm.md`: dock model (taffy tree), socket protocol
     (list/spawn/focus/write/close/open-file), app-registry TOML, open-file +
     pwd-follow flows, default keymap.
